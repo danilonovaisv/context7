@@ -10,8 +10,8 @@ Use this package to:
 
 The package provides two main tools:
 
-- `resolveLibrary` - Searches Context7's database to find the correct library ID
-- `getLibraryDocs` - Fetches documentation for a specific library with optional topic filtering
+- `resolveLibraryId` - Searches Context7's database to find the correct library ID
+- `queryDocs` - Fetches documentation for a specific library with optional topic/query filtering
 
 ## Quick Start
 
@@ -30,7 +30,7 @@ Get your API key from [Context7](https://context7.com)
 ### Using Tools with `generateText`
 
 ```typescript
-import { resolveLibrary, getLibraryDocs } from "@upstash/context7-tools-ai-sdk";
+import { resolveLibraryId, queryDocs } from "@upstash/context7-tools-ai-sdk";
 import { generateText, stepCountIs } from "ai";
 import { openai } from "@ai-sdk/openai";
 
@@ -38,8 +38,8 @@ const { text } = await generateText({
   model: openai("gpt-4o"),
   prompt: "How do I use React Server Components?",
   tools: {
-    resolveLibrary: resolveLibrary(),
-    getLibraryDocs: getLibraryDocs(),
+    resolveLibraryId: resolveLibraryId(),
+    queryDocs: queryDocs(),
   },
   stopWhen: stepCountIs(5),
 });
@@ -79,7 +79,7 @@ CONTEXT7_API_KEY=ctx7sk-...
 Then use tools and agents without explicit configuration:
 
 ```typescript
-const tool = resolveLibrary(); // Uses CONTEXT7_API_KEY automatically
+const tool = resolveLibraryId(); // Uses CONTEXT7_API_KEY automatically
 ```
 
 ## Docs
