@@ -1,5 +1,7 @@
 let appPromise: any = null;
 
+export const runtime = "nodejs";
+
 export default async function handler(req: any, res: any) {
   if (!appPromise) {
     appPromise = import("../packages/mcp/src/index.js").then((mod) => mod.app);

@@ -4,15 +4,47 @@
     {
       "src": "api/mcp.ts",
       "use": "@vercel/node"
+    },
+    {
+      "src": "api/health.ts",
+      "use": "@vercel/node"
+    },
+    {
+      "src": "api/context7/resolve-library-id.ts",
+      "use": "@vercel/node"
+    },
+    {
+      "src": "api/context7/get-library-docs.ts",
+      "use": "@vercel/node"
     }
   ],
   "routes": [
+    {
+      "src": "/api/health",
+      "dest": "api/health.ts"
+    },
+    {
+      "src": "/api/context7/resolve-library-id",
+      "dest": "api/context7/resolve-library-id.ts"
+    },
+    {
+      "src": "/api/context7/get-library-docs",
+      "dest": "api/context7/get-library-docs.ts"
+    },
     {
       "src": "/mcp/(.*)",
       "dest": "api/mcp.ts"
     },
     {
       "src": "/mcp",
+      "dest": "api/mcp.ts"
+    },
+    {
+      "src": "/api/mcp",
+      "dest": "api/mcp.ts"
+    },
+    {
+      "src": "/api/mcp/(.*)",
       "dest": "api/mcp.ts"
     },
     {
