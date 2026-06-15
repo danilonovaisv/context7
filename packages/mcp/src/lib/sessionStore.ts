@@ -9,13 +9,12 @@ const SESSION_KEY_PREFIX = "#mcp#session#";
 // so an unreachable Redis shouldn't block clients. Ghost sessions self-heal on
 // the next refresh (returns false → client gets 404 → re-inits).
 export function createSessionStore() {
-  const redis = getRedis();
-
   const getSessionKey = (sessionId: string) => `${SESSION_KEY_PREFIX}${sessionId}`;
 
   return {
     async create(sessionId: string) {
       try {
+        const redis = getRedis();
         await redis.set(getSessionKey(sessionId), "1", { ex: SESSION_TTL_SECONDS });
       } catch (err) {
         console.error(`Error creating Redis session record ${sessionId}:`, err);
@@ -24,6 +23,7 @@ export function createSessionStore() {
 
     async refresh(sessionId: string) {
       try {
+        const redis = getRedis();
         // One TTL call tells us both whether the key exists AND how much time it has left.
         // Only issue an EXPIRE write when the key is approaching expiry
         const ttl = await redis.ttl(getSessionKey(sessionId));
@@ -40,6 +40,7 @@ export function createSessionStore() {
 
     async delete(sessionId: string) {
       try {
+        const redis = getRedis();
         await redis.del(getSessionKey(sessionId));
       } catch (err) {
         console.error(`Error deleting Redis session record ${sessionId}:`, err);
