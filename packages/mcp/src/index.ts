@@ -112,12 +112,12 @@ function getClientContext(): ClientContext {
  * Extract client IP address from request headers.
  * Handles X-Forwarded-For header for proxied requests.
  */
-function getClientIp(req: express.Request): string | undefined {
+function getClientIp(req: any): string | undefined {
   const forwardedFor = req.headers["x-forwarded-for"] || req.headers["X-Forwarded-For"];
 
   if (forwardedFor) {
     const ips = Array.isArray(forwardedFor) ? forwardedFor[0] : forwardedFor;
-    const ipList = ips.split(",").map((ip) => ip.trim());
+    const ipList = ips.split(",").map((ip: string) => ip.trim());
 
     for (const ip of ipList) {
       const plainIp = ip.replace(/^::ffff:/, "");
@@ -359,7 +359,7 @@ function installTransportArgAliasing(transport: Transport): void {
 const app = express();
 app.use(express.json());
 
-app.use((req: express.Request, res: express.Response, next: express.NextFunction) => {
+app.use((req: any, res: any, next: any) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS,DELETE");
   res.setHeader(
@@ -391,7 +391,7 @@ const extractBearerToken = (authHeader: string | string[] | undefined): string |
   return header;
 };
 
-const extractApiKey = (req: express.Request): string | undefined => {
+const extractApiKey = (req: any): string | undefined => {
   return (
     extractBearerToken(req.headers.authorization) ||
     extractHeaderValue(req.headers["context7-api-key"]) ||
@@ -404,8 +404,8 @@ const extractApiKey = (req: express.Request): string | undefined => {
 const sessionStore = createSessionStore();
 
 const handleMcpRequest = async (
-  req: express.Request,
-  res: express.Response,
+  req: any,
+  res: any,
   requireAuth: boolean
 ) => {
   // Reject GET requests — sessions are tracked in Redis, but this server does not send
@@ -546,22 +546,22 @@ const handleMcpRequest = async (
 };
 
 // Anonymous access endpoint - no authentication required
-app.all("/mcp", async (req, res) => {
+app.all("/mcp", async (req: any, res: any) => {
   await handleMcpRequest(req, res, false);
 });
 
 // OAuth-protected endpoint - requires authentication
-app.all("/mcp/oauth", async (req, res) => {
+app.all("/mcp/oauth", async (req: any, res: any) => {
   await handleMcpRequest(req, res, true);
 });
 
-app.get("/ping", (_req: express.Request, res: express.Response) => {
+app.get("/ping", (_req: any, res: any) => {
   res.json({ status: "ok", message: "pong" });
 });
 
 // OAuth 2.0 Protected Resource Metadata (RFC 9728)
 // Used by MCP clients to discover the authorization server
-app.get("/.well-known/oauth-protected-resource", (_req: express.Request, res: express.Response) => {
+app.get("/.well-known/oauth-protected-resource", (_req: any, res: any) => {
   res.json({
     resource: RESOURCE_URL,
     authorization_servers: [AUTH_SERVER_URL],
@@ -572,7 +572,7 @@ app.get("/.well-known/oauth-protected-resource", (_req: express.Request, res: ex
 
 app.get(
   "/.well-known/oauth-authorization-server",
-  async (_req: express.Request, res: express.Response) => {
+  async (_req: any, res: any) => {
     const authServerUrl = AUTH_SERVER_URL;
 
     try {
@@ -597,7 +597,7 @@ app.get(
 );
 
 // OpenAI Apps SDK domain verification challenge
-app.get("/.well-known/openai-apps-challenge", (_req: express.Request, res: express.Response) => {
+app.get("/.well-known/openai-apps-challenge", (_req: any, res: any) => {
   if (!OPENAI_APPS_CHALLENGE_TOKEN) {
     return res.status(404).json({
       error: "not_found",
@@ -608,7 +608,7 @@ app.get("/.well-known/openai-apps-challenge", (_req: express.Request, res: expre
 });
 
 // Catch-all 404 handler - must be after all other routes
-app.use((_req: express.Request, res: express.Response) => {
+app.use((_req: any, res: any) => {
   res.status(404).json({
     error: "not_found",
     message: "Endpoint not found. Use /mcp for MCP protocol communication.",
