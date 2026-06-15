@@ -356,297 +356,298 @@ function installTransportArgAliasing(transport: Transport): void {
   };
 }
 
+const app = express();
+app.use(express.json());
+
+app.use((req: express.Request, res: express.Response, next: express.NextFunction) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS,DELETE");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, MCP-Session-Id, MCP-Protocol-Version, X-Context7-API-Key, Context7-API-Key, X-API-Key, Authorization"
+  );
+  res.setHeader("Access-Control-Expose-Headers", "MCP-Session-Id");
+
+  if (req.method === "OPTIONS") {
+    res.sendStatus(200);
+    return;
+  }
+  next();
+});
+
+const extractHeaderValue = (value: string | string[] | undefined): string | undefined => {
+  if (!value) return undefined;
+  return typeof value === "string" ? value : value[0];
+};
+
+const extractBearerToken = (authHeader: string | string[] | undefined): string | undefined => {
+  const header = extractHeaderValue(authHeader);
+  if (!header) return undefined;
+
+  if (header.startsWith("Bearer ")) {
+    return header.substring(7).trim();
+  }
+
+  return header;
+};
+
+const extractApiKey = (req: express.Request): string | undefined => {
+  return (
+    extractBearerToken(req.headers.authorization) ||
+    extractHeaderValue(req.headers["context7-api-key"]) ||
+    extractHeaderValue(req.headers["x-api-key"]) ||
+    extractHeaderValue(req.headers["context7_api_key"]) ||
+    extractHeaderValue(req.headers["x_api_key"])
+  );
+};
+
+const sessionStore = createSessionStore();
+
+const handleMcpRequest = async (
+  req: express.Request,
+  res: express.Response,
+  requireAuth: boolean
+) => {
+  // Reject GET requests — sessions are tracked in Redis, but this server does not send
+  // server-initiated notifications, so SSE streams serve no purpose and cause mass NGINX
+  // timeouts. Returning 405 is spec-compliant per MCP StreamableHTTP (2025-03-26).
+  if (req.method === "GET") {
+    return res.status(405).json({
+      jsonrpc: "2.0",
+      error: { code: -32000, message: "Server does not support GET requests" },
+      id: null,
+    });
+  }
+
+  try {
+    const apiKey = extractApiKey(req);
+    const resourceUrl = RESOURCE_URL;
+    const baseUrl = new URL(resourceUrl).origin;
+
+    // OAuth discovery info header, used by MCP clients to discover the authorization server
+    res.set(
+      "WWW-Authenticate",
+      `Bearer resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`
+    );
+
+    if (requireAuth) {
+      if (!apiKey) {
+        return res.status(401).json({
+          jsonrpc: "2.0",
+          error: {
+            code: -32001,
+            message: "Authentication required. Please authenticate to use this MCP server.",
+          },
+          id: null,
+        });
+      }
+
+      if (isJWT(apiKey)) {
+        const validationResult = await validateJWT(apiKey);
+        if (!validationResult.valid) {
+          return res.status(401).json({
+            jsonrpc: "2.0",
+            error: {
+              code: -32001,
+              message: validationResult.error || "Invalid token. Please re-authenticate.",
+            },
+            id: null,
+          });
+        }
+      }
+    }
+
+    const context: ClientContext = {
+      clientIp: getClientIp(req),
+      apiKey: apiKey,
+      clientInfo: extractClientInfoFromUserAgent(req.headers["user-agent"]),
+      transport: "http",
+    };
+
+    const sessionId = extractHeaderValue(req.headers["mcp-session-id"]);
+
+    if (req.method === "DELETE") {
+      if (!sessionId) {
+        return res.status(400).json({
+          jsonrpc: "2.0",
+          error: { code: -32000, message: "Bad Request: No valid session ID provided" },
+          id: null,
+        });
+      }
+      await sessionStore.delete(sessionId);
+      return res.status(200).end();
+    }
+
+    let effectiveSessionId: string;
+    if (!sessionId && req.method === "POST" && isInitializeRequest(req.body)) {
+      effectiveSessionId = randomUUID();
+      await sessionStore.create(effectiveSessionId);
+      res.setHeader("mcp-session-id", effectiveSessionId);
+    } else if (sessionId && req.method === "POST" && !isInitializeRequest(req.body)) {
+      const sessionExists = await sessionStore.refresh(sessionId);
+      if (!sessionExists) {
+        // Per MCP Streamable HTTP spec: 404 signals to the client that the session
+        // has been terminated/expired, so it should re-initialize with a fresh InitializeRequest.
+        return res.status(404).json({
+          jsonrpc: "2.0",
+          error: {
+            code: -32000,
+            message: "Session not found or expired. Please re-initialize.",
+          },
+          id: null,
+        });
+      }
+      effectiveSessionId = sessionId;
+    } else {
+      return res.status(400).json({
+        jsonrpc: "2.0",
+        error: { code: -32000, message: "Bad Request: No valid session ID provided" },
+        id: null,
+      });
+    }
+
+    context.sessionId = effectiveSessionId;
+
+    // sessionIdGenerator is undefined because session lifecycle (create/refresh/delete)
+    // is owned by the route handler above and persisted in Redis, not by the SDK transport.
+    //
+    // Use SSE responses for tool calls (enableJsonResponse: false). The SDK then
+    // flushes response headers immediately after parsing the request rather than
+    // buffering until the tool returns. This is required for long-running tools
+    // because some MCP HTTP clients cap the underlying fetch at 60s waiting for
+    // headers, even though the per-tool timeout is much higher.
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined,
+      enableJsonResponse: false,
+    });
+
+    const server = createMcpServer();
+    res.on("close", () => {
+      transport.close();
+      server.close();
+    });
+
+    installTransportArgAliasing(transport);
+    await server.connect(transport);
+
+    await requestContext.run(context, async () => {
+      await transport.handleRequest(req, res, req.body);
+    });
+  } catch (error) {
+    console.error("Error handling MCP request:", error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: "2.0",
+        error: { code: -32603, message: "Internal server error" },
+        id: null,
+      });
+    }
+  }
+};
+
+// Anonymous access endpoint - no authentication required
+app.all("/mcp", async (req, res) => {
+  await handleMcpRequest(req, res, false);
+});
+
+// OAuth-protected endpoint - requires authentication
+app.all("/mcp/oauth", async (req, res) => {
+  await handleMcpRequest(req, res, true);
+});
+
+app.get("/ping", (_req: express.Request, res: express.Response) => {
+  res.json({ status: "ok", message: "pong" });
+});
+
+// OAuth 2.0 Protected Resource Metadata (RFC 9728)
+// Used by MCP clients to discover the authorization server
+app.get(
+  "/.well-known/oauth-protected-resource",
+  (_req: express.Request, res: express.Response) => {
+    res.json({
+      resource: RESOURCE_URL,
+      authorization_servers: [AUTH_SERVER_URL],
+      scopes_supported: ["profile", "email"],
+      bearer_methods_supported: ["header"],
+    });
+  }
+);
+
+app.get(
+  "/.well-known/oauth-authorization-server",
+  async (_req: express.Request, res: express.Response) => {
+    const authServerUrl = AUTH_SERVER_URL;
+
+    try {
+      const response = await fetch(`${authServerUrl}/.well-known/oauth-authorization-server`);
+      if (!response.ok) {
+        console.error("[OAuth] Upstream error:", response.status);
+        return res.status(response.status).json({
+          error: "upstream_error",
+          message: "Failed to fetch authorization server metadata",
+        });
+      }
+      const metadata = await response.json();
+      res.json(metadata);
+    } catch (error) {
+      console.error("[OAuth] Error fetching OAuth metadata:", error);
+      res.status(502).json({
+        error: "proxy_error",
+        message: "Failed to proxy authorization server metadata",
+      });
+    }
+  }
+);
+
+// OpenAI Apps SDK domain verification challenge
+app.get(
+  "/.well-known/openai-apps-challenge",
+  (_req: express.Request, res: express.Response) => {
+    if (!OPENAI_APPS_CHALLENGE_TOKEN) {
+      return res.status(404).json({
+        error: "not_found",
+        message: "Endpoint not found.",
+      });
+    }
+    res.type("text/plain").send(OPENAI_APPS_CHALLENGE_TOKEN);
+  }
+);
+
+// Catch-all 404 handler - must be after all other routes
+app.use((_req: express.Request, res: express.Response) => {
+  res.status(404).json({
+    error: "not_found",
+    message: "Endpoint not found. Use /mcp for MCP protocol communication.",
+  });
+});
+
+const startServer = (port: number, maxAttempts = 10) => {
+  const httpServer = app.listen(port);
+
+  httpServer.once("error", (err: NodeJS.ErrnoException) => {
+    if (err.code === "EADDRINUSE" && port < (CLI_PORT ?? DEFAULT_PORT) + maxAttempts) {
+      console.warn(`Port ${port} is in use, trying port ${port + 1}...`);
+      startServer(port + 1, maxAttempts);
+    } else {
+      console.error(`Failed to start server: ${err.message}`);
+      process.exit(1);
+    }
+  });
+
+  httpServer.once("listening", () => {
+    console.error(
+      `Context7 Documentation MCP Server v${SERVER_VERSION} running on HTTP at http://localhost:${port}/mcp`
+    );
+  });
+};
+
+export { app };
+
 async function main() {
   const transportType = TRANSPORT_TYPE;
 
   if (transportType === "http") {
     const initialPort = CLI_PORT ?? DEFAULT_PORT;
-
-    const app = express();
-    app.use(express.json());
-
-    app.use((req: express.Request, res: express.Response, next: express.NextFunction) => {
-      res.setHeader("Access-Control-Allow-Origin", "*");
-      res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS,DELETE");
-      res.setHeader(
-        "Access-Control-Allow-Headers",
-        "Content-Type, MCP-Session-Id, MCP-Protocol-Version, X-Context7-API-Key, Context7-API-Key, X-API-Key, Authorization"
-      );
-      res.setHeader("Access-Control-Expose-Headers", "MCP-Session-Id");
-
-      if (req.method === "OPTIONS") {
-        res.sendStatus(200);
-        return;
-      }
-      next();
-    });
-
-    const extractHeaderValue = (value: string | string[] | undefined): string | undefined => {
-      if (!value) return undefined;
-      return typeof value === "string" ? value : value[0];
-    };
-
-    const extractBearerToken = (authHeader: string | string[] | undefined): string | undefined => {
-      const header = extractHeaderValue(authHeader);
-      if (!header) return undefined;
-
-      if (header.startsWith("Bearer ")) {
-        return header.substring(7).trim();
-      }
-
-      return header;
-    };
-
-    const extractApiKey = (req: express.Request): string | undefined => {
-      return (
-        extractBearerToken(req.headers.authorization) ||
-        extractHeaderValue(req.headers["context7-api-key"]) ||
-        extractHeaderValue(req.headers["x-api-key"]) ||
-        extractHeaderValue(req.headers["context7_api_key"]) ||
-        extractHeaderValue(req.headers["x_api_key"])
-      );
-    };
-
-    const sessionStore = createSessionStore();
-
-    const handleMcpRequest = async (
-      req: express.Request,
-      res: express.Response,
-      requireAuth: boolean
-    ) => {
-      // Reject GET requests — sessions are tracked in Redis, but this server does not send
-      // server-initiated notifications, so SSE streams serve no purpose and cause mass NGINX
-      // timeouts. Returning 405 is spec-compliant per MCP StreamableHTTP (2025-03-26).
-      if (req.method === "GET") {
-        return res.status(405).json({
-          jsonrpc: "2.0",
-          error: { code: -32000, message: "Server does not support GET requests" },
-          id: null,
-        });
-      }
-
-      try {
-        const apiKey = extractApiKey(req);
-        const resourceUrl = RESOURCE_URL;
-        const baseUrl = new URL(resourceUrl).origin;
-
-        // OAuth discovery info header, used by MCP clients to discover the authorization server
-        res.set(
-          "WWW-Authenticate",
-          `Bearer resource_metadata="${baseUrl}/.well-known/oauth-protected-resource"`
-        );
-
-        if (requireAuth) {
-          if (!apiKey) {
-            return res.status(401).json({
-              jsonrpc: "2.0",
-              error: {
-                code: -32001,
-                message: "Authentication required. Please authenticate to use this MCP server.",
-              },
-              id: null,
-            });
-          }
-
-          if (isJWT(apiKey)) {
-            const validationResult = await validateJWT(apiKey);
-            if (!validationResult.valid) {
-              return res.status(401).json({
-                jsonrpc: "2.0",
-                error: {
-                  code: -32001,
-                  message: validationResult.error || "Invalid token. Please re-authenticate.",
-                },
-                id: null,
-              });
-            }
-          }
-        }
-
-        const context: ClientContext = {
-          clientIp: getClientIp(req),
-          apiKey: apiKey,
-          clientInfo: extractClientInfoFromUserAgent(req.headers["user-agent"]),
-          transport: "http",
-        };
-
-        const sessionId = extractHeaderValue(req.headers["mcp-session-id"]);
-
-        if (req.method === "DELETE") {
-          if (!sessionId) {
-            return res.status(400).json({
-              jsonrpc: "2.0",
-              error: { code: -32000, message: "Bad Request: No valid session ID provided" },
-              id: null,
-            });
-          }
-          await sessionStore.delete(sessionId);
-          return res.status(200).end();
-        }
-
-        let effectiveSessionId: string;
-        if (!sessionId && req.method === "POST" && isInitializeRequest(req.body)) {
-          effectiveSessionId = randomUUID();
-          await sessionStore.create(effectiveSessionId);
-          res.setHeader("mcp-session-id", effectiveSessionId);
-        } else if (sessionId && req.method === "POST" && !isInitializeRequest(req.body)) {
-          const sessionExists = await sessionStore.refresh(sessionId);
-          if (!sessionExists) {
-            // Per MCP Streamable HTTP spec: 404 signals to the client that the session
-            // has been terminated/expired, so it should re-initialize with a fresh InitializeRequest.
-            return res.status(404).json({
-              jsonrpc: "2.0",
-              error: {
-                code: -32000,
-                message: "Session not found or expired. Please re-initialize.",
-              },
-              id: null,
-            });
-          }
-          effectiveSessionId = sessionId;
-        } else {
-          return res.status(400).json({
-            jsonrpc: "2.0",
-            error: { code: -32000, message: "Bad Request: No valid session ID provided" },
-            id: null,
-          });
-        }
-
-        context.sessionId = effectiveSessionId;
-
-        // sessionIdGenerator is undefined because session lifecycle (create/refresh/delete)
-        // is owned by the route handler above and persisted in Redis, not by the SDK transport.
-        //
-        // Use SSE responses for tool calls (enableJsonResponse: false). The SDK then
-        // flushes response headers immediately after parsing the request rather than
-        // buffering until the tool returns. This is required for long-running tools
-        // because some MCP HTTP clients cap the underlying fetch at 60s waiting for
-        // headers, even though the per-tool timeout is much higher.
-        const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: undefined,
-          enableJsonResponse: false,
-        });
-
-        const server = createMcpServer();
-        res.on("close", () => {
-          transport.close();
-          server.close();
-        });
-
-        installTransportArgAliasing(transport);
-        await server.connect(transport);
-
-        await requestContext.run(context, async () => {
-          await transport.handleRequest(req, res, req.body);
-        });
-      } catch (error) {
-        console.error("Error handling MCP request:", error);
-        if (!res.headersSent) {
-          res.status(500).json({
-            jsonrpc: "2.0",
-            error: { code: -32603, message: "Internal server error" },
-            id: null,
-          });
-        }
-      }
-    };
-
-    // Anonymous access endpoint - no authentication required
-    app.all("/mcp", async (req, res) => {
-      await handleMcpRequest(req, res, false);
-    });
-
-    // OAuth-protected endpoint - requires authentication
-    app.all("/mcp/oauth", async (req, res) => {
-      await handleMcpRequest(req, res, true);
-    });
-
-    app.get("/ping", (_req: express.Request, res: express.Response) => {
-      res.json({ status: "ok", message: "pong" });
-    });
-
-    // OAuth 2.0 Protected Resource Metadata (RFC 9728)
-    // Used by MCP clients to discover the authorization server
-    app.get(
-      "/.well-known/oauth-protected-resource",
-      (_req: express.Request, res: express.Response) => {
-        res.json({
-          resource: RESOURCE_URL,
-          authorization_servers: [AUTH_SERVER_URL],
-          scopes_supported: ["profile", "email"],
-          bearer_methods_supported: ["header"],
-        });
-      }
-    );
-
-    app.get(
-      "/.well-known/oauth-authorization-server",
-      async (_req: express.Request, res: express.Response) => {
-        const authServerUrl = AUTH_SERVER_URL;
-
-        try {
-          const response = await fetch(`${authServerUrl}/.well-known/oauth-authorization-server`);
-          if (!response.ok) {
-            console.error("[OAuth] Upstream error:", response.status);
-            return res.status(response.status).json({
-              error: "upstream_error",
-              message: "Failed to fetch authorization server metadata",
-            });
-          }
-          const metadata = await response.json();
-          res.json(metadata);
-        } catch (error) {
-          console.error("[OAuth] Error fetching OAuth metadata:", error);
-          res.status(502).json({
-            error: "proxy_error",
-            message: "Failed to proxy authorization server metadata",
-          });
-        }
-      }
-    );
-
-    // OpenAI Apps SDK domain verification challenge
-    app.get(
-      "/.well-known/openai-apps-challenge",
-      (_req: express.Request, res: express.Response) => {
-        if (!OPENAI_APPS_CHALLENGE_TOKEN) {
-          return res.status(404).json({
-            error: "not_found",
-            message: "Endpoint not found.",
-          });
-        }
-        res.type("text/plain").send(OPENAI_APPS_CHALLENGE_TOKEN);
-      }
-    );
-
-    // Catch-all 404 handler - must be after all other routes
-    app.use((_req: express.Request, res: express.Response) => {
-      res.status(404).json({
-        error: "not_found",
-        message: "Endpoint not found. Use /mcp for MCP protocol communication.",
-      });
-    });
-
-    const startServer = (port: number, maxAttempts = 10) => {
-      const httpServer = app.listen(port);
-
-      httpServer.once("error", (err: NodeJS.ErrnoException) => {
-        if (err.code === "EADDRINUSE" && port < initialPort + maxAttempts) {
-          console.warn(`Port ${port} is in use, trying port ${port + 1}...`);
-          startServer(port + 1, maxAttempts);
-        } else {
-          console.error(`Failed to start server: ${err.message}`);
-          process.exit(1);
-        }
-      });
-
-      httpServer.once("listening", () => {
-        console.error(
-          `Context7 Documentation MCP Server v${SERVER_VERSION} running on HTTP at http://localhost:${port}/mcp`
-        );
-      });
-    };
-
     startServer(initialPort);
   } else {
     stdioApiKey = cliOptions.apiKey || process.env.CONTEXT7_API_KEY;
@@ -678,7 +679,9 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error("Fatal error in main():", error);
-  process.exit(1);
-});
+if (!process.env.VERCEL) {
+  main().catch((error) => {
+    console.error("Fatal error in main():", error);
+    process.exit(1);
+  });
+}
